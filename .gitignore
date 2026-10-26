@@ -4,3 +4,4 @@ models/*.onnx.data
 models/*.engine
 build/
 *_trackon.mp4
+*_tapnextpp.mp4

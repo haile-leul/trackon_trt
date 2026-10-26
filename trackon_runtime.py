@@ -347,12 +347,15 @@ class PointTracker:
   add(x, y)    -> id, starts tracking on the next step()
   remove(ids)  stops tracking those ids (takes effect immediately)
   step(frame_bgr) -> dict id -> (x, y, vx, vy, vis_prob, visible)
-  The frame (or `roi` of it) is resized to the model input (512x384), exactly
-  like the official Predictor resizes the full frame.
+  The frame (or `roi` of it) is resized to the model input (Track-On2 512x384,
+  TAPNext++ 512x512), exactly like the official code resizes the full frame.
+  Works with the Track-On2 backends here and the TAPNext++ ones in tapnextpp_runtime.
   """
 
-  def __init__(self, backend, roi=None, delta_v=0.8):
-    self.b, self.roi, self.delta_v = backend, roi, delta_v
+  def __init__(self, backend, roi=None, delta_v=None):
+    self.b, self.roi = backend, roi
+    self.delta_v = delta_v if delta_v is not None else getattr(backend, 'delta_v', 0.8)
+    self.in_w, self.in_h = getattr(backend, 'input_size', (INPUT_W, INPUT_H))
     self.ids = []            # row -> id
     self.pending = []        # (id, x, y) to add on the next step
     self.state = {}          # id -> dict
@@ -361,7 +364,7 @@ class PointTracker:
 
   def _scale(self, w, h):
     rx, ry, rw, rh = self.roi if self.roi else (0, 0, w, h)
-    return rx, ry, rw / INPUT_W, rh / INPUT_H
+    return rx, ry, rw / self.in_w, rh / self.in_h
 
   def add(self, x, y):
     i = self.next_id
@@ -382,11 +385,12 @@ class PointTracker:
   def num_points(self):
     return len(self.ids) + len(self.pending)
 
-  def median_velocity(self, ids):
-    """Median (vx, vy) in px/frame of the given ids (visible points that already
-    have a velocity), plus the number of points used; (None, None, 0) if none."""
+  def median_velocity(self, ids, require_visible=True):
+    """Median (vx, vy) in px/frame of the given ids (points that already have a
+    velocity and, if require_visible, are visible), plus the number of points
+    used; (None, None, 0) if none."""
     v = [(s['vx'], s['vy']) for i in ids for s in [self.state.get(i)]
-         if s and s['visible'] and s['has_v']]
+         if s and (s['visible'] or not require_visible) and s['has_v']]
     if not v:
       return None, None, 0
     v = np.array(v)
@@ -396,8 +400,8 @@ class PointTracker:
     import cv2  # pylint: disable=g-import-not-at-top
     h, w = frame_bgr.shape[:2]
     rx, ry, sx, sy = self._scale(w, h)
-    crop = frame_bgr if not self.roi else frame_bgr[int(ry):int(ry + sy * INPUT_H), int(rx):int(rx + sx * INPUT_W)]
-    rgb = cv2.cvtColor(cv2.resize(crop, (INPUT_W, INPUT_H), interpolation=cv2.INTER_LINEAR), cv2.COLOR_BGR2RGB)
+    crop = frame_bgr if not self.roi else frame_bgr[int(ry):int(ry + sy * self.in_h), int(rx):int(rx + sx * self.in_w)]
+    rgb = cv2.cvtColor(cv2.resize(crop, (self.in_w, self.in_h), interpolation=cv2.INTER_LINEAR), cv2.COLOR_BGR2RGB)
     new = np.array([[(x - rx) / sx, (y - ry) / sy] for _, x, y in self.pending], np.float32).reshape(-1, 2)
     self.ids += [p[0] for p in self.pending]
     born = {p[0] for p in self.pending}

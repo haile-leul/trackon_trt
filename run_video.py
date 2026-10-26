@@ -1,4 +1,6 @@
-"""Run Track-On2 on a video (PyTorch, ONNX Runtime or TensorRT) and render the tracks.
+"""Run a point tracker (Track-On2 or TAPNext++) on a video (PyTorch, ONNX Runtime or
+TensorRT) and render the tracks. --model picks the tracker; everything else (point
+schedule, detections, outputs) is the same for both.
 
 Examples (all coordinates in ORIGINAL video pixels):
   # TensorRT, 8x8 grid on the first frame, live window
@@ -19,7 +21,12 @@ Examples (all coordinates in ORIGINAL video pixels):
   python run_video.py --video gate.mp4 --backend torch --trackon-root ../track_on --ckpt ../trackon2_dinov3_checkpoint.pt
   python run_video.py --video gate.mp4 --backend ort-cuda
 
-Output video next to the input (<name>_trackon.mp4), finalised at the end or on
+  # TAPNext++ (512x512): TensorRT engine / ONNX / the PyTorch wrapper of the official model
+  python run_video.py --model tapnextpp --video gate.mp4 --backend trt --dets gate_dets.txt
+  python run_video.py --model tapnextpp --video gate.mp4 --backend ort-cuda --grid 8
+  python run_video.py --model tapnextpp --video gate.mp4 --backend torch --tapnet-root ../tapnet --weights ../tapnextpp_512.ckpt
+
+Output video next to the input (<name>_<model>.mp4), finalised at the end or on
 Ctrl+C. Timing summary at the end (TensorRT also reports pure GPU time).
 """
 
@@ -33,6 +40,7 @@ import cv2
 import numpy as np
 
 from trackon_runtime import PointTracker, make_backend
+import tapnextpp_runtime
 
 
 def box(s):
@@ -150,11 +158,19 @@ def color(i):
 def main():
   ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   ap.add_argument('--video', required=True)
+  ap.add_argument('--model', default='trackon', choices=['trackon', 'tapnextpp'], help='point tracker')
   ap.add_argument('--backend', default='trt', choices=['trt', 'ort-cuda', 'ort-cpu', 'torch'])
   ap.add_argument('--models-dir', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models'))
   ap.add_argument('--trackon-root', help='track_on repo clone (torch backend)')
   ap.add_argument('--ckpt', help='Track-On2 / Track-On-R checkpoint (torch backend)')
-  ap.add_argument('--torch-fp16', action='store_true', help='torch backend with fp16 autocast')
+  ap.add_argument('--torch-fp16', action='store_true', help='torch backend with fp16 autocast (Track-On2)')
+  ap.add_argument('--tapnet-root', help='tapnet repo clone (TAPNext++ torch backend)')
+  ap.add_argument('--weights', help='tapnextpp_512.ckpt (TAPNext++ torch backend)')
+  ap.add_argument('--onnx', help='TAPNext++ ONNX (default <models-dir>/tapnextpp_step_512.onnx)')
+  ap.add_argument('--engine', help='TAPNext++ TensorRT engine (default <models-dir>/tapnextpp_step_512.engine)')
+  ap.add_argument('--resolution', type=int, default=512, help='TAPNext++ torch backend: input size')
+  ap.add_argument('--new-points', choices=['prototype', 'reset'], default='prototype',
+                  help='TAPNext++: a new point starts from the prototype state (= official late query) or empty')
   ap.add_argument('--roi', help='x,y,w,h region given to the model (default: full frame)')
   ap.add_argument('--grid', type=int, default=0, help='NxN grid at frame 0')
   ap.add_argument('--grid-box', help='x,y,w,h for --grid (default: ROI / full frame)')
@@ -211,8 +227,13 @@ def main():
   full = roi or (0.0, 0.0, float(W), float(H))
 
   t0 = time.time()
-  backend = make_backend(args.backend, models_dir=args.models_dir, trackon_root=args.trackon_root,
-                         ckpt=args.ckpt, fp16=args.torch_fp16, fake_dinov3=args.fake_dinov3)
+  if args.model == 'tapnextpp':
+    backend = tapnextpp_runtime.make_backend(args.backend, models_dir=args.models_dir, tapnet_root=args.tapnet_root,
+                                             weights=args.weights, onnx_path=args.onnx, engine=args.engine,
+                                             resolution=args.resolution, new_points=args.new_points)
+  else:
+    backend = make_backend(args.backend, models_dir=args.models_dir, trackon_root=args.trackon_root,
+                           ckpt=args.ckpt, fp16=args.torch_fp16, fake_dinov3=args.fake_dinov3)
   print(f'{backend.name} ready in {time.time() - t0:.1f}s')
   tracker = PointTracker(backend, roi=roi)
   add, rem, rem_box = build_schedule(args, full)
@@ -227,7 +248,7 @@ def main():
 
   writer, out = None, None
   if not args.benchmark:
-    out = os.path.abspath(args.out or os.path.splitext(args.video)[0] + '_trackon.mp4')
+    out = os.path.abspath(args.out or os.path.splitext(args.video)[0] + f'_{args.model}.mp4')
     writer = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*'mp4v'), fps, (W, H))
     if not writer.isOpened():
       out = os.path.splitext(out)[0] + '.avi'
@@ -326,12 +347,12 @@ def main():
         if writer is not None:
           writer.write(vis)
         if args.show:
-          cv2.imshow('track-on2', vis)
+          cv2.imshow(args.model, vis)
           if (cv2.waitKey(1) & 0xFF) == 27:
             break
       t += 1
       if args.progress_every and t % args.progress_every == 0 and step_ms:
-        g = f', GPU enc {np.mean([x[0] for x in gpu[-25:]]):.1f} + trk {np.mean([x[1] for x in gpu[-25:]]):.1f} ms' if gpu else ''
+        g = f', GPU {np.mean([sum(x) for x in gpu[-25:]]):.1f} ms' if gpu else ''
         print(f'frame {t}/{n_frames if n_frames > 0 else "?"}: step {np.mean(step_ms[-25:]):.1f} ms{g}, '
               f'{tracker.num_points} points, overall {t / (time.perf_counter() - t_wall):.1f} fps', flush=True)
   except KeyboardInterrupt:

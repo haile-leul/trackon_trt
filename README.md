@@ -8,6 +8,8 @@ This repo deploys [Track-On2 / Track-On-R](https://github.com/gorkaydemir/track_
 - **Video tool:** `run_video.py` adds and removes points at any frame.
 - **C++:** a header-only TensorRT tracker.
 
+It also deploys **[TAPNext++](https://github.com/google-deepmind/tapnet/tree/main/tapnet/tapnextpp)** (512×512 checkpoint) with the same runtime interface; `run_video.py --model trackon|tapnextpp` picks the tracker. See [TAPNext++](#tapnext-512).
+
 **No mmcv needed.** Track-On2's deformable attention is an mmcv CUDA op that can't be exported. `trackon_export/msda.py` re-implements it in pure PyTorch with the same parameters and maths (`grid_sample`). That makes the model exportable, and the original repo runs without mmcv, including on Windows.
 
 ## How it works
@@ -196,6 +198,43 @@ This development machine has no GPU, and HuggingFace is blocked by its network p
 - **Removing points:** PyTorch and ONNX backends with points added and removed. Identical tracks (`run_video.py` CSVs match exactly).
 - **TensorRT:** not run here (no GPU). The engine builder's tagging was checked on the exported graphs. The C++ tracker compiles cleanly (`-Wall -Wextra`) against the TensorRT 10.13 headers. `build_trt_engines.py` verifies the engines against ONNX Runtime on your machine.
 
+## TAPNext++ (512)
+
+TAPNext++ is a TRecViT: every token passes 12 blocks of *Griffin SSM over time → ViT attention over the frame*. The tokens of a frame are the 64×64 image patches (512×512 input, patch 8) plus one token per point. The only memory between frames is the SSM state of every token in every layer: 3 conv-history vectors and the RG-LRU state, i.e. 4×768 floats per token and layer.
+
+`tapnextpp_export/step.py` writes one frame as a pure function, so the state is explicit:
+
+| input | shape | |
+|---|---|---|
+| `frame` | `[1,3,512,512]` | RGB 0..255 |
+| `video_state` | `[12,4,4096,768]` | state of the patch tokens (0.6 GB) |
+| `video_reset` | `[1]` | 1 = start a new sequence |
+| `point_state` | `[N,12,4,768]` | one row per point |
+| `point_ctl` | `[N,4]` | `qx, qy` (512 px), token (0 mask / 1 query / 2 unknown), reset |
+
+Outputs are `point_out [N,4]` (x, y in 512 px, visibility logit, certainty) and the next `video_state` / `point_state`.
+
+**Adding a point mid-video costs nothing extra.** The official model gives a point queried at frame *t* the `unknown` token before *t*, the query token at *t* and the `mask` token after. The runtime keeps one `unknown` row, the prototype, on every frame. A new point starts from a copy of the prototype's state and gets the query token on the frame it is added. With one late point this is *identical* to the official model. Removing a point deletes its row. Nothing is re-initialised. When there are no points the model is not run; the next frame with points starts a new sequence, like the official first frame.
+
+```powershell
+git clone https://github.com/google-deepmind/tapnet ..\tapnet
+curl.exe -L -o ..\tapnextpp_512.ckpt https://storage.googleapis.com/gresearch/tapnextpp/tapnextpp_512.ckpt
+python export_tapnextpp_onnx.py --tapnet-root ..\tapnet --weights ..\tapnextpp_512.ckpt   # models\tapnextpp_step_512.onnx + checks
+python tools\build_tapnextpp_engine.py                                                    # models\tapnextpp_step_512.engine + check
+python run_video.py --model tapnextpp --video C:\videos\gate.mp4 --backend trt --dets gate_dets.txt
+python run_video.py --model tapnextpp --video C:\videos\gate.mp4 --backend ort-cuda --grid 8
+```
+
+**Cost.** One frame is about 2.1 TFLOP: 4096 tokens through full attention and the SSM in 12 layers. On top of that, 1.2 GB of state is read and written on the GPU every frame. You need a GPU with tensor cores (RTX 20xx or newer) and at least 8 GB. A GTX 1650 (1.85 TFLOPS fp32, slow fp16, 4 GB) will not run it usefully.
+
+**Verified here (CPU, official checkpoint):**
+- `TapNextPPStep` vs the official `TAPNext` forward with its online state: max difference 6e-5 px at 512.
+- A point added online vs the official model with that point queried late: identical (0.000 px).
+- ONNX Runtime vs PyTorch, with points added (prototype copy and reset) and removed: max difference 1.7e-4 px.
+- `run_video.py` tracks with the ONNX and PyTorch backends agree within CSV rounding.
+- Keeping the state in fp16 between frames changes positions by less than 0.004 px, with one outlier frame at 0.24 px.
+- The TensorRT engine was not built here (no GPU). `build_tapnextpp_engine.py` checks it against ONNX Runtime on your machine.
+
 ## Files
 
 | path | |
@@ -210,5 +249,9 @@ This development machine has no GPU, and HuggingFace is blocked by its network p
 | `tools/check_env.py`, `tools/gpu_bench.py` | environment check; GPU vs model speed |
 | `cpp/trackon_trt.hpp`, `cpp/demo.cpp`, `cpp/CMakeLists.txt` | C++ TensorRT tracker + demo |
 | `scripts/windows_quickstart.ps1` | steps 2–4 in one go |
+| `tapnextpp_export/step.py` | TAPNext++ one-frame step with explicit state (`TapNextPPStep`), checkpoint loader |
+| `export_tapnextpp_onnx.py` | TAPNext++ ONNX export + checks against the official model and PyTorch |
+| `tools/build_tapnextpp_engine.py` | TAPNext++ TensorRT engine + check against ONNX Runtime |
+| `tapnextpp_runtime.py` | TAPNext++ backends (`torch`, `ort-cpu`, `ort-cuda`, `trt`), same interface as `trackon_runtime` |
 
-Track-On is licensed by its authors (see the official repo). The DINOv3 weights are under Meta's DINOv3 license.
+Track-On is licensed by its authors (see the official repo). The DINOv3 weights are under Meta's DINOv3 license. TAPNext++ code and checkpoint: Apache 2.0 (google-deepmind/tapnet).
